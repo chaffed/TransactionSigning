@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from cryptography.hazmat.primitives import serialization
@@ -26,6 +26,9 @@ class KeyEntry:
     public_key: Ed25519PublicKey
     status: str = "active"  # "active" | "revoked"
     owner: str = ""
+    # "routing:account" pairs this key may authorize (payment mandates);
+    # empty for issuer keys that only sign their own checks/entries.
+    accounts: list[str] = field(default_factory=list)
 
 
 class Keyring:
@@ -35,8 +38,9 @@ class Keyring:
     def get(self, kid: str) -> KeyEntry | None:
         return self.entries.get(kid)
 
-    def add(self, kid: str, public_key: Ed25519PublicKey, owner: str = "") -> None:
-        self.entries[kid] = KeyEntry(kid, public_key, "active", owner)
+    def add(self, kid: str, public_key: Ed25519PublicKey, owner: str = "",
+            accounts: list[str] | None = None) -> None:
+        self.entries[kid] = KeyEntry(kid, public_key, "active", owner, list(accounts or []))
 
     def revoke(self, kid: str) -> None:
         self.entries[kid].status = "revoked"
@@ -47,7 +51,8 @@ class Keyring:
         entries = {}
         for kid, e in raw.items():
             pub = Ed25519PublicKey.from_public_bytes(base64.b64decode(e["public_key"]))
-            entries[kid] = KeyEntry(kid, pub, e.get("status", "active"), e.get("owner", ""))
+            entries[kid] = KeyEntry(kid, pub, e.get("status", "active"), e.get("owner", ""),
+                                    e.get("accounts", []))
         return cls(entries)
 
     def save(self, path: str | Path) -> None:
@@ -60,6 +65,7 @@ class Keyring:
                 ).decode(),
                 "status": e.status,
                 "owner": e.owner,
+                **({"accounts": e.accounts} if e.accounts else {}),
             }
             for kid, e in self.entries.items()
         }

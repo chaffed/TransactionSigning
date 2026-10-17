@@ -1,4 +1,10 @@
-# TransactionSigning — signed-QR checks for Positive Pay (PoC)
+# TransactionSigning — signed checks and payments (PoC)
+
+Two proofs of concept that share one signing approach: Ed25519 signatures over
+clear-text records. `checksign` puts a signed QR code on printed checks;
+`paysign` adds signed mandates and entries to ACH CTX and ISO 20022 debits.
+
+## Checks: signed QR for Positive Pay (`checksign`)
 
 The issuer prints each check with a QR code. The QR holds the payee, amount,
 serial, account, routing number, and issue date in clear text, plus an
@@ -95,3 +101,93 @@ The signature proves the *data* came from the key holder. It says nothing about 
 
 Synthetic data only: the issuers and banks are fictional, the routing numbers fail the
 ABA checksum on purpose, and every image is marked SPECIMEN.
+
+---
+
+# Signed debits over ACH CTX and ISO 20022 (`paysign`)
+
+The same idea applied to electronic debits, with signatures from both parties.
+Each party signs with **its own private key**:
+
+| Record | Signed by | Proves | Verified with |
+|---|---|---|---|
+| `MD1` mandate | **payer**, once at setup | "I authorize originator X to debit my account, up to $Y, at frequency Z, until date D" | the payer's public key, enrolled at the payer's own bank for that account |
+| `PE1` entry | **originator**, for each debit | "I sent this debit for this amount, date and ID, under that mandate" | the originator's public key, **embedded in the payer-signed mandate** (`OPK`) |
+
+The mandate carries the originator's public key, so the paying bank needs only its own
+customer's key. There is no directory of originator keys: the payer vouches for the
+originator. Each entry includes `MH`, a hash of the exact signed mandate, so an entry
+can't be moved under a different mandate.
+
+```bash
+.venv/bin/python -m paysign demo                 # writes to out/paysign/
+.venv/bin/python -m paysign filter ach out/paysign/ach/03_FERRO-0001.ach \
+    --keyring out/paysign/rdfi_payer_keyring.json \
+    --mandates-on-file out/paysign/rdfi_mandates_on_file.txt
+```
+
+## Where the signed records go
+
+| Rail | Mandate (`MD1`) | Entry (`PE1`) |
+|---|---|---|
+| **ACH CTX** | X12 820 in the type 05 addenda, split into `REF*ZZ*MD1-nn-NN*<80 chars>` segments | same, `REF*ZZ*PE1-nn-NN*…` |
+| **ISO 20022** pain.008 → pacs.003 | `DrctDbtTx/MndtRltdInf/ElctrncSgntr` (Max1025Text, which ISO defines for the debtor's digital signature) | `SplmtryData/Envlp/ps:SgndNtry` |
+
+The records use only uppercase letters and base32 signatures. That survives ACH
+software that uppercases text, and stays inside the X12 basic character set.
+Neither `*` nor `\` (the X12 delimiters) can appear in a record.
+
+## Paying-bank debit filter
+
+The filter is the same code for both rails. It runs these checks:
+
+1. **Mandate.** Signed by a key enrolled *for this account*, so another customer of the
+   bank can't sign a mandate for your account. It must name this originator, be inside
+   its date window, and not be revoked.
+2. **Entry.** Its signature verifies against the `OPK` in the mandate. Its amount, date,
+   account, originator ID and entry ID match the message, and its `MH` matches the
+   mandate.
+3. **Limits and history.** The amount is within `MAX`. Frequency (`ONCE`, `WEEK`, `MNTH`,
+   `ADHC`) and replay are checked against a ledger of accepted entries.
+
+Demo results (identical on both rails):
+
+| Scenario | Decision | Finding |
+|---|---|---|
+| Valid debit within mandate | ACCEPT | — |
+| Amount altered in transit | RETURN (R29 / AM09) | `AMOUNT_MISMATCH` |
+| Originator signs a debit over the mandate maximum | RETURN (R29 / AM09) | `EXCEEDS_MANDATE_LIMIT` |
+| Replay of an accepted entry | RETURN (R24 / AM05) | `DUPLICATE_ENTRY` |
+| Second debit in the same month on a monthly mandate | RETURN | `FREQUENCY_EXCEEDED` |
+| Spoofed originator: real mandate, attacker-signed entry | RETURN | `ENTRY_SIG_INVALID` |
+| Mandate for this account signed by a *different* customer | RETURN | `MANDATE_SIGNER_NOT_ACCOUNT_HOLDER` |
+| No mandate | RETURN (R29 / MD01) | `MANDATE_MISSING` |
+| Revoked mandate, expired mandate | RETURN | `MANDATE_REVOKED`, `MANDATE_EXPIRED` |
+| Entry moved under a looser mandate | RETURN | `MANDATE_HASH_MISMATCH` |
+| Signed data stripped in transit | **REVIEW** | `ENTRY_SIGNATURE_MISSING` |
+
+**Mandates on file.** When ACH addenda are stripped, the mandate is lost *and* so is
+the entry signature, because ACH has nowhere else to put them. ISO keeps the mandate
+in a core field and loses only the `SplmtryData`. The filter therefore falls back to
+mandates the payer registered with its own bank, much like an ACH debit-filter
+authorization list today, and re-verifies their signatures. A stripped debit then goes
+to REVIEW instead of being returned as unauthorized.
+
+## Gaps between this PoC and production
+
+- **Return codes.** The mapping is indicative. CTX is a corporate SEC code, so returns
+  use R29; consumer debits would use R05, R07, R10 or R11.
+- **Message formats.**
+  - The X12 820 is minimal, with no ISA/GS envelope. The segment and qualifier
+    choices need to be agreed with the banks' 820 implementation guides.
+  - The ISO XML follows the .001.08 element order but has **not been validated against
+    the official XSDs**.
+  - CCD has only one 80-character addendum, which is too small for this scheme. Use
+    CTX, or rely on mandates on file.
+- **Originator key rotation.** The originator key is fixed in the mandate, so rotating
+  it needs a mandate amendment, which the payer re-signs.
+- **Key enrollment and custody.** The payer's key has to be enrolled through the bank's
+  authenticated channel (online banking, treasury portal). Keep keys in an HSM or KMS
+  on both sides.
+- **Credits.** Not built. They would use only the originator signature, checked
+  against the receiver's keyring of known payers.
