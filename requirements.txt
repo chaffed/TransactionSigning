@@ -1,0 +1,5 @@
+cryptography>=42
+segno>=1.6
+zxing-cpp>=2.2
+Pillow>=10.0
+pytest>=8
